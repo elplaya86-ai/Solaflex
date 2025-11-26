@@ -1,0 +1,252 @@
+# =============================================
+# Solaflex: Advanced Pump.fun Rug Pull Detector Web App
+# 
+# This is an enhanced Streamlit web app inspired by modern crypto platforms like Vector.fun.
+# It provides a real-time dashboard for monitoring new Pump.fun token launches on Solana,
+# with sophisticated features including:
+#   - Real-time detection and risk scoring
+#   - Interactive token table with sorting and filtering
+#   - Embedded Dexscreener charts for price analysis
+#   - Watchlist for tracking specific tokens
+#   - Simulated notifications and social sharing links
+#   - Historical log with export to CSV
+# 
+# Requirements:
+#   - Python 3.8+
+#   - pip install streamlit solana solders asyncio pandas st_aggrid requests
+# 
+# Usage:
+#   - Run: streamlit run solaflex_app.py
+#   - Access: http://localhost:8501
+# 
+# Author: elplaya86-ai (powered by Grok from xAI)
+# Date: November 26, 2025
+# =============================================
+
+import os
+import asyncio
+import json
+from datetime import datetime
+import streamlit as st
+import pandas as pd
+import requests
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+from solana.publickey import PublicKey
+from solders.pubkey import Pubkey
+from st_aggrid import AgGrid, GridOptionsBuilder
+
+# === Configuration ===
+RPC_URL = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+
+# Program IDs
+PUMP_FUN_PROGRAM = PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+RAYDIUM_AMM = PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+TOKEN_PROGRAM = PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
+# Session state initialization
+if 'detected_tokens' not in st.session_state:
+    st.session_state.detected_tokens = []
+if 'watchlist' not in st.session_state:
+    st.session_state.watchlist = []
+if 'notifications' not in st.session_state:
+    st.session_state.notifications = []
+
+async def monitor_launches():
+    async with AsyncClient(RPC_URL) as client:
+        logs_sub = await client.logs_subscribe(
+            filters={"mentions": [str(PUMP_FUN_PROGRAM)]},
+            commitment=Confirmed
+        )
+
+        async for msg in logs_sub:
+            try:
+                logs = msg.value.logs
+                signature = msg.value.signature
+
+                if any("create" in log.lower() for log in logs):
+                    tx_resp = await client.get_transaction(
+                        signature,
+                        encoding="jsonParsed",
+                        max_supported_transaction_version=0
+                    )
+                    if not tx_resp.value:
+                        continue
+
+                    tx = tx_resp.value
+                    post_token_balances = tx.meta.post_token_balances or []
+                    creator = tx.transaction.transaction.message.account_keys[0].pubkey
+
+                    mint = None
+                    for bal in post_token_balances:
+                        if bal.ui_token_amount.amount == "1000000000":
+                            mint = bal.mint
+                            break
+
+                    if not mint:
+                        continue
+
+                    mint_pubkey = PublicKey(mint)
+
+                    # Perform checks
+                    alerts = []
+                    good_signs = []
+
+                    mint_account_resp = await client.get_account_info(mint_pubkey)
+                    mint_account = mint_account_resp.value
+                    if mint_account and mint_account.data:
+                        data = mint_account.data
+
+                        if len(data) >= 36:
+                            mint_auth_bytes = data[4:36]
+                            mint_auth = Pubkey.from_bytes(mint_auth_bytes)
+                            if mint_auth == Pubkey.default():
+                                good_signs.append("Mint authority REVOKED")
+                            else:
+                                alerts.append(f"Mint authority ACTIVE: {mint_auth}")
+
+                        if len(data) >= 68:
+                            freeze_auth_bytes = data[36:68]
+                            freeze_auth = Pubkey.from_bytes(freeze_auth_bytes)
+                            if freeze_auth == Pubkey.default():
+                                good_signs.append("Freeze authority REVOKED")
+                            else:
+                                alerts.append(f"Freeze authority ACTIVE: {freeze_auth}")
+
+                    burned_lp = any("Burn" in log and "Raydium" in log for log in logs)
+                    if burned_lp:
+                        good_signs.append("LP tokens BURNED")
+                    else:
+                        alerts.append("LP tokens NOT burned")
+
+                    # Risk score: 0-100 (lower is better risk)
+                    risk_score = len(alerts) * 33  # Simple scoring: each alert adds 33 points
+                    risk_level = "Low" if risk_score < 33 else "Medium" if risk_score < 66 else "High"
+                    risk_color = "green" if risk_level == "Low" else "orange" if risk_level == "Medium" else "red"
+
+                    # Fetch additional token info (e.g., from Dexscreener API)
+                    dex_info = fetch_dexscreener_data(mint)
+                    price = dex_info.get('price', 'N/A')
+                    market_cap = dex_info.get('market_cap', 'N/A')
+
+                    # Store detection
+                    detection = {
+                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Mint": mint,
+                        "Creator": str(creator),
+                        "Signature": signature,
+                        "Good Signs": ", ".join(good_signs),
+                        "Red Flags": ", ".join(alerts),
+                        "Risk Level": risk_level,
+                        "Risk Score": risk_score,
+                        "Price": price,
+                        "Market Cap": market_cap
+                    }
+                    st.session_state.detected_tokens.append(detection)
+
+                    # Simulate notification
+                    st.session_state.notifications.append(f"New launch: {mint} - Risk: {risk_level}")
+
+                    st.rerun()
+
+            except Exception as e:
+                pass
+
+def fetch_dexscreener_data(mint):
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data['pairs']:
+                pair = data['pairs'][0]
+                return {
+                    'price': pair.get('priceUsd', 'N/A'),
+                    'market_cap': pair.get('fdv', 'N/A')
+                }
+    except:
+        pass
+    return {'price': 'N/A', 'market_cap': 'N/A'}
+
+# === Streamlit App ===
+st.set_page_config(page_title="Solaflex: Pump.fun Detector", page_icon="🚨", layout="wide")
+
+st.title("🚀 Solaflex: Advanced Real-time Pump.fun Rug Pull Detector")
+st.markdown("""
+Inspired by modern crypto apps like Vector.fun, Solaflex offers real-time memecoin discovery, risk analysis, and interactive tools for safer trading on Solana.
+Monitor launches, analyze risks, and track your watchlist!
+""")
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.text(f"📡 RPC: {RPC_URL}")
+    if st.button("Clear Detected Tokens"):
+        st.session_state.detected_tokens = []
+        st.rerun()
+    st.header("🔔 Notifications")
+    for notif in st.session_state.notifications[-5:]:  # Show last 5
+        st.info(notif)
+    st.header("📌 Watchlist")
+    new_watch = st.text_input("Add Mint to Watchlist")
+    if st.button("Add") and new_watch:
+        st.session_state.watchlist.append(new_watch)
+    for w in st.session_state.watchlist:
+        col1, col2 = st.columns([3,1])
+        col1.write(w)
+        if col2.button("X", key=w):
+            st.session_state.watchlist.remove(w)
+            st.rerun()
+
+# Main Dashboard
+col1, col2 = st.columns([2,1])
+
+with col1:
+    st.subheader("📊 Detected Launches")
+    if st.session_state.detected_tokens:
+        df = pd.DataFrame(st.session_state.detected_tokens)
+        
+        # Interactive AgGrid table
+        gb = GridOptionsBuilder.from_dataframe(df)
+        gb.configure_pagination(paginationAutoPageSize=True)
+        gb.configure_side_bar()
+        gb.configure_selection('single')
+        grid_options = gb.build()
+        grid_response = AgGrid(df, gridOptions=grid_options, enable_enterprise_modules=True)
+        
+        # Export to CSV
+        csv = df.to_csv(index=False)
+        st.download_button("📥 Download CSV", csv, "detected_tokens.csv")
+        
+        # Selected row details
+        selected = grid_response['selected_rows']
+        if selected:
+            sel_row = selected[0]
+            st.subheader(f"💎 Details for {sel_row['Mint']}")
+            st.markdown(f"**Risk:** :{sel_row['Risk Level'].lower()}[{sel_row['Risk Level']} ({sel_row['Risk Score']}/100)]")
+            st.markdown(f"**Price:** ${sel_row['Price']}")
+            st.markdown(f"**Market Cap:** ${sel_row['Market Cap']}")
+            st.markdown(f"**Good Signs:** {sel_row['Good Signs']}")
+            st.markdown(f"**Red Flags:** {sel_row['Red Flags']}")
+            st.markdown(f"**Transaction:** [Solscan](https://solscan.io/tx/{sel_row['Signature']})")
+            st.markdown(f"**Pump.fun:** [View](https://pump.fun/{sel_row['Signature'][:44]})")
+            st.markdown(f"**Share:** [Post on X](https://x.com/intent/post?text=Check%20this%20Pump.fun%20launch:%20{mint}%20-%20Risk:%20{sel_row['Risk Level']})")
+    else:
+        st.info("👀 Listening for new Pump.fun launches...")
+
+with col2:
+    st.subheader("📈 Live Chart")
+    selected_mint = st.text_input("Enter Mint for Chart", value=(selected[0]['Mint'] if selected else ""))
+    if selected_mint:
+        st.markdown("### Dexscreener Chart")
+        chart_url = f"https://dexscreener.com/solana/{selected_mint}?embed=1&theme=dark&trades=0&info=0"
+        st.components.v1.iframe(chart_url, height=500)
+
+# Background monitoring
+if 'monitoring_task' not in st.session_state:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    st.session_state.monitoring_task = loop.create_task(monitor_launches())
+    loop.run_until_complete(asyncio.sleep(0))  # Allow async to start
+
+st.markdown("---")
