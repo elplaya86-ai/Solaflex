@@ -1,0 +1,11 @@
+solana
+solders
+asyncio
+# Contributing to Solaflex
+
+Thanks for your interest! To contribute:
+1. Fork the repo and create a feature branch.
+2. Test your changes locally.
+3. Submit a PR with a clear description.
+
+Focus areas: New rug checks, alerts, or Solana integrations. Issues welcome!
